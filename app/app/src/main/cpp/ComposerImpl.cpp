@@ -14,6 +14,9 @@
 #include <vndk/hardware_buffer.h>
 #include <vndk/window.h>
 
+#include <private/gui/ComposerServiceAIDL.h>
+#include <android/gui/ISurfaceComposer.h>
+
 #include "ComposerImpl.h"
 
 using namespace android;
@@ -78,6 +81,14 @@ namespace vendor {
 namespace lindroid {
 namespace composer {
 
+namespace {
+struct TransactionContext {
+    ComposerDisplay* display = nullptr;
+    ASurfaceControl* surfaceControl = nullptr;
+    uint64_t seq = 0;
+};
+}
+
 ndk::ScopedAStatus ComposerImpl::registerCallback(const std::shared_ptr<IComposerCallback> &in_cb, int32_t sequenceId) {
     ALOGI("%s: sequenceId: %d", __FUNCTION__, sequenceId);
     std::vector<int64_t> hotplugDisplays;
@@ -128,8 +139,43 @@ ndk::ScopedAStatus ComposerImpl::acceptChanges(int64_t in_displayId) {
 }
 
 ndk::ScopedAStatus ComposerImpl::getReleaseFence(int64_t in_displayId, ndk::ScopedFileDescriptor *_aidl_return) {
-    (void)in_displayId;
-    *_aidl_return = ndk::ScopedFileDescriptor();
+    ComposerDisplay* display = nullptr;
+    int64_t vsyncPeriod = 0;
+    {
+        Mutex::Autolock _l(mLock);
+        auto it = mDisplays.find(in_displayId);
+        if (it == mDisplays.end() || it->second == nullptr) {
+            *_aidl_return = ndk::ScopedFileDescriptor();
+            return ndk::ScopedAStatus::ok();
+        }
+        display = it->second;
+        vsyncPeriod = display->displayConfig.vsyncPeriod;
+    }
+
+    // blocks until the transaction completes so the fence returned
+    // belongs to the buffer that transaction replsced
+    if (!(vsyncPeriod > 0))
+        vsyncPeriod = 16666667;
+    const auto timeout = std::chrono::nanoseconds(vsyncPeriod * 3);
+
+    int fd = -1;
+    {
+        std::unique_lock<std::mutex> lock(display->mFenceLock);
+        const uint64_t want = display->mAppliedSeq;
+        if (!display->mFenceCv.wait_for(
+                lock, timeout, [display, want] { return display->mCompletedSeq >= want; })) {
+            ALOGW("%s: timed out on transaction %" PRIu64 " display %" PRId64,
+                  __FUNCTION__, want, in_displayId);
+        }
+        fd = display->mReleaseFenceFd;
+        display->mReleaseFenceFd = -1;
+    }
+
+    if (fd >= 0) {
+        *_aidl_return = ndk::ScopedFileDescriptor(fd);
+    } else {
+        *_aidl_return = ndk::ScopedFileDescriptor();
+    }
     return ndk::ScopedAStatus::ok();
 }
 
@@ -165,8 +211,30 @@ ndk::ScopedAStatus ComposerImpl::setPowerMode(int64_t in_displayId, int32_t in_m
     return ndk::ScopedAStatus::ok();
 }
 
+void ComposerImpl::setForceClientComposition(bool enabled) {
+    if (mForcedClientComposition == enabled)
+        return;
+
+    sp<::android::gui::ISurfaceComposer> sf =
+        ::android::ComposerServiceAIDL::getComposerService();
+    if (sf == nullptr) {
+        ALOGE("%s: no composer service", __FUNCTION__);
+        return;
+    }
+
+    const auto status = sf->forceClientComposition(enabled);
+    if (!status.isOk()) {
+        ALOGE("%s: failed: %s", __FUNCTION__, status.toString8().c_str());
+        return;
+    }
+
+    mForcedClientComposition = enabled;
+    ALOGI("%s: %d", __FUNCTION__, enabled);
+}
+
 void ComposerImpl::onAppForegroundChanged(int64_t displayId, bool foreground) {
     ALOGI("%s: Display: %" PRId64 " foreground: %d", __FUNCTION__, displayId, foreground);
+    setForceClientComposition(foreground);
     if (mCallbacks == nullptr)
         return;
     mCallbacks->onAppForegroundChanged(mSequenceId, displayId, foreground);
@@ -236,20 +304,47 @@ ndk::ScopedAStatus ComposerImpl::setBuffer(int64_t in_displayId, const HardwareB
 
         ASurfaceTransaction* transaction = ASurfaceTransaction_create();
 
-        ASurfaceTransaction_setOnComplete(transaction, display,
-            [](void* ctx, ASurfaceTransactionStats* stats) {
-                auto* d = static_cast<ComposerDisplay*>(ctx);
-                if (!d) return;
-                const int fd = ASurfaceTransactionStats_getPresentFenceFd(stats);
-                const int storeFd = fd >= 0 ? ::dup(fd) : -1;
-                if (fd >= 0) ::close(fd);
-                int oldFd = -1;
-                {
-                    std::lock_guard<std::mutex> lock(d->mFenceLock);
-                    oldFd = d->mPresentFenceFd;
-                    d->mPresentFenceFd = storeFd;
+        auto* ctx = new TransactionContext();
+        ctx->display = display;
+        ctx->surfaceControl = surfaceControl;
+        ASurfaceControl_acquire(surfaceControl);
+        {
+            std::lock_guard<std::mutex> lock(display->mFenceLock);
+            ctx->seq = ++display->mAppliedSeq;
+        }
+
+        ASurfaceTransaction_setOnComplete(transaction, ctx,
+            [](void* raw, ASurfaceTransactionStats* stats) {
+                auto* c = static_cast<TransactionContext*>(raw);
+                if (!c) return;
+                ComposerDisplay* d = c->display;
+
+                const int presentFd = ASurfaceTransactionStats_getPresentFenceFd(stats);
+                const int releaseFd = ASurfaceTransactionStats_getPreviousReleaseFenceFd(
+                    stats, c->surfaceControl);
+
+                int oldPresentFd = -1;
+                int oldReleaseFd = -1;
+                if (d) {
+                    {
+                        std::lock_guard<std::mutex> lock(d->mFenceLock);
+                        oldPresentFd = d->mPresentFenceFd;
+                        d->mPresentFenceFd = presentFd;
+                        oldReleaseFd = d->mReleaseFenceFd;
+                        d->mReleaseFenceFd = releaseFd;
+                        if (c->seq > d->mCompletedSeq)
+                            d->mCompletedSeq = c->seq;
+                    }
+                    d->mFenceCv.notify_all();
+                } else {
+                    close_if_valid(presentFd);
+                    close_if_valid(releaseFd);
                 }
-                if (oldFd >= 0) ::close(oldFd);
+                close_if_valid(oldPresentFd);
+                close_if_valid(oldReleaseFd);
+
+                ASurfaceControl_release(c->surfaceControl);
+                delete c;
             });
 
         ASurfaceTransaction_setFrameRateWithChangeStrategy(
@@ -403,12 +498,18 @@ void ComposerImpl::onSurfaceDestroyed(int64_t displayId, sp<Surface> surface, AN
             display->surfaceControl = nullptr;
         }
         int oldFd = -1;
+        int oldReleaseFd = -1;
         {
             std::lock_guard<std::mutex> fl(display->mFenceLock);
             oldFd = display->mPresentFenceFd;
             display->mPresentFenceFd = -1;
+            oldReleaseFd = display->mReleaseFenceFd;
+            display->mReleaseFenceFd = -1;
+            display->mCompletedSeq = display->mAppliedSeq;
         }
+        display->mFenceCv.notify_all();
         if (oldFd >= 0) ::close(oldFd);
+        if (oldReleaseFd >= 0) ::close(oldReleaseFd);
     }
 }
 
@@ -429,12 +530,18 @@ void ComposerImpl::onDisplayDestroyed(int64_t displayId) {
         display->plugged = false;
         display->mVsyncThread.stop();
         int oldFd = -1;
+        int oldReleaseFd = -1;
         {
             std::lock_guard<std::mutex> fl(display->mFenceLock);
             oldFd = display->mPresentFenceFd;
             display->mPresentFenceFd = -1;
+            oldReleaseFd = display->mReleaseFenceFd;
+            display->mReleaseFenceFd = -1;
+            display->mCompletedSeq = display->mAppliedSeq;
         }
+        display->mFenceCv.notify_all();
         if (oldFd >= 0) ::close(oldFd);
+        if (oldReleaseFd >= 0) ::close(oldReleaseFd);
     }
 
     if (mCallbacks != nullptr)

@@ -59,7 +59,11 @@ struct ComposerDisplay {
     bool plugged = false;
     VsyncThread mVsyncThread;
     std::mutex mFenceLock;
+    std::condition_variable mFenceCv;
     int mPresentFenceFd{-1};
+    int mReleaseFenceFd{-1};
+    uint64_t mAppliedSeq{0};
+    uint64_t mCompletedSeq{0};
 };
 
 class ComposerImpl : public BnComposer {
@@ -81,6 +85,7 @@ public:
     void onSurfaceDestroyed(int64_t displayId, sp<Surface> surface, ANativeWindow *nativeWindow);
     void onDisplayDestroyed(int64_t displayId);
     void onAppForegroundChanged(int64_t displayId, bool foreground);
+    void setForceClientComposition(bool enabled);
 
 private:
     Mutex mLock;
@@ -90,6 +95,7 @@ private:
     std::unordered_map<int64_t, ComposerDisplay*> mDisplays;
     
     bool m_ui_running = false;
+    bool mForcedClientComposition = false;
 };
 
 } // namespace composer
