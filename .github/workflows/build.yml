@@ -33,6 +33,20 @@ jobs:
           echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> app/keystore.properties
           echo "storeFile=${{ secrets.STORE_FILE }}" >> app/keystore.properties
 
+      - name: Generate Temporary Keystore
+        run: |
+          # 使用 keytool 生成一个有效期 10000 天的临时 keystore
+          keytool -genkeypair -v \
+            -storetype JKS \
+            -keyalg RSA -keysize 2048 \
+            -validity 10000 \
+            -keystore app/${{ secrets.STORE_FILE }} \
+            -alias ${{ secrets.KEY_ALIAS }} \
+            -storepass ${{ secrets.STORE_PASSWORD }} \
+            -keypass ${{ secrets.KEY_PASSWORD }} \
+            -dname "CN=Debug, OU=Debug, O=Debug, L=Debug, ST=Debug, C=CN"
+        shell: bash
+
       # 4. 赋予 gradlew 可执行权限（这一步非常重要，常被遗漏）
       - name: Make gradlew executable
         run: 
