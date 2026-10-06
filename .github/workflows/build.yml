@@ -21,9 +21,10 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # 3. 配置 Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
       # 4. 赋予 gradlew 可执行权限（这一步非常重要，常被遗漏）
       - name: Make gradlew executable
