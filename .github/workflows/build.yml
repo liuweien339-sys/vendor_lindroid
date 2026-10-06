@@ -28,11 +28,15 @@ jobs:
 
       # 4. 赋予 gradlew 可执行权限（这一步非常重要，常被遗漏）
       - name: Make gradlew executable
-        run: chmod +x ./gradlew
+        run: 
+         cd app
+         chmod +x ./gradlew
 
       # 5. 编译 Debug APK
       - name: Build Debug APK
-        run: ./gradlew assembleDebug
+        run: 
+         cd app
+         ./gradlew assembleDebug
 
       # 6. 上传编译产物
       - name: Upload APK
